@@ -1,8 +1,10 @@
 from __future__ import annotations
 import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
 import pandas as pd
 import numpy as np
 import os
+import math
 
 
 def plot_sessions(
@@ -112,6 +114,8 @@ def plot_eye_endpoints(
     show: bool = True,
     save_path: str | None = None,
     title: str | None = None,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
 ) -> plt.Figure:
     """
     Plot fixation baselines, saccade endpoints, and predicted targets.
@@ -176,6 +180,10 @@ def plot_eye_endpoints(
     ax.set_xlabel("X (tracker units)")
     ax.set_ylabel("Y (tracker units)")
     ax.axis("equal")
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
     if title:
         ax.set_title(title)
     ax.legend()
@@ -198,59 +206,50 @@ def plot_eye_endpoints(
 def plot_error_histogram(
     df: pd.DataFrame,
     err_col: str = "err",
-    bins: int = 60,
-    bin_range: tuple[float, float] = (-20, 20),
-    color: str = "steelblue",
+    bins: int = 1000,
+    bin_range: tuple[float, float] = (-180, 180),
+    color: str = "k",
     alpha: float = 0.8,
-    figsize: tuple[int, int] = (7, 5),
-    title: str = "Histogram of saccade angular error",
+    figsize: tuple[int, int] = (7, 4),
+    title: str = "Angular Error Distribution",
     show: bool = True,
     save_path: str | None = None,
 ) -> plt.Figure:
     """
-    Plot a histogram of saccade angular error (in degrees).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame containing the error column.
-    err_col : str, optional
-        Column name for angular error (default 'err').
-    bins : int, optional
-        Number of histogram bins (default 60).
-    bin_range : tuple, optional
-        Range of the histogram in degrees (default (-20, 20)).
-    color : str, optional
-        Bar color (default 'steelblue').
-    alpha : float, optional
-        Transparency for bars (default 0.8).
-    figsize : tuple[int, int], optional
-        Figure size in inches (default (7, 5)).
-    title : str, optional
-        Plot title.
-    show : bool, optional
-        Whether to display the plot immediately (default True).
-    save_path : str | None, optional
-        If provided, saves the figure to the given path.
-
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-        The generated figure.
+    Plot histogram of error values with probability density on the y-axis.
     """
+
     if err_col not in df.columns:
         raise ValueError(f"Column '{err_col}' not found in DataFrame.")
 
     err = df[err_col].dropna()
 
     fig, ax = plt.subplots(figsize=figsize)
-    ax.hist(err, bins=bins, range=bin_range, color=color, alpha=alpha, edgecolor="k")
 
-    ax.set_xlabel("Error (curr − resp) [deg]")
-    ax.set_ylabel("Count")
-    ax.set_title(title)
+    # Histogram normalized to probability density
+    ax.hist(
+        err,
+        bins=bins,
+        range=bin_range,
+        color=color,
+        alpha=alpha,
+        density=True,
+    )
+
+    ax.set_xlabel("Error (deg)", fontsize=20)
+    ax.set_ylabel("Probability", fontsize=20)
+    ax.set_title(title, fontsize=22)
+
+    ax.tick_params(axis="both", which="major", labelsize=20)
+    ax.set_xticks([-180, -90, 0, 90, 180])
+    ax.set_yticks([0, 0.05, 0.1])
+
+    # Vertical line at zero error
     ax.axvline(0, color="red", linestyle="--", label="perfect alignment")
-    ax.legend()
+    ax.legend(fontsize=15)
+
+    ax.set_xlim(bin_range)
+    
     plt.tight_layout()
 
     if save_path:
@@ -261,41 +260,46 @@ def plot_error_histogram(
     else:
         plt.close(fig)
 
-    # return fig
+    return fig
 
 
 
 def plot_error_variability_vs_delay(
     df: pd.DataFrame,
     delay_col: str = "delay",
-    err_col: str = "err",
-    bins: int = 200,
+    err_col: str = "abs_err",
+    bins: int = 2000,  # deprecated, kept for backward compatibility
     figsize: tuple[int, int] = (7, 5),
     color: str = "steelblue",
-    alpha: float = 0.8,
+    alpha: float = 0.1,
     show: bool = True,
     save_path: str | None = None,
     title: str = "Error variability vs. memory delay",
 ) -> plt.Figure:
     """
-    Plot the relationship between memory delay duration and variability in angular error.
+    Plot the relationship between memory delay duration and error magnitude,
+    and test whether error tends to increase or decrease with delay.
+
+    This version does NOT bin the data. It uses single-trial data and a
+    Spearman rank correlation to assess monotonic trend.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain `delay` and `err` columns (from memory-delay features).
+        Must contain `delay_col` and `err_col` columns.
+        `err_col` should reflect error magnitude (e.g. absolute or folded error).
     delay_col : str, optional
         Column name for memory delay (default "delay").
     err_col : str, optional
-        Column name for angular error (default "err").
-    bins : int, optional
-        Number of quantile bins to divide the delay range (default 200).
+        Column name for error magnitude (default "folded_err").
+    bins : int, optional (deprecated)
+        Ignored. Kept only for backward compatibility.
     figsize : tuple[int, int], optional
-        Size of the figure (default (7,5)).
+        Size of the figure (default (7, 5)).
     color : str, optional
-        Point color for scatter (default "steelblue").
+        Color for scatter points (default "steelblue").
     alpha : float, optional
-        Transparency of scatter points (default 0.8).
+        Transparency of scatter points (default 0.3).
     show : bool, optional
         Whether to display the figure immediately (default True).
     save_path : str | None, optional
@@ -311,31 +315,44 @@ def plot_error_variability_vs_delay(
     if delay_col not in df.columns or err_col not in df.columns:
         raise ValueError(f"Missing required columns: {delay_col}, {err_col}")
 
+    # Drop NaNs
     valid = df[[delay_col, err_col]].dropna().copy()
 
-    # Bin delay into quantiles
-    valid["delay_bin"] = pd.qcut(valid[delay_col], q=bins, duplicates="drop")
+    if valid.empty:
+        raise ValueError("No valid (non-NaN) rows for delay and error columns.")
 
-    # Compute per-bin means and stds
-    stats = valid.groupby("delay_bin", observed=False).agg(
-        delay_mean=(delay_col, "mean"),
-        err_std=(err_col, "std")
-    ).reset_index()
+    x = valid[delay_col].to_numpy()
+    y = valid[err_col].to_numpy()
 
+    # Spearman rank correlation: does error tend to go up or down with delay?
+    rho, pval = spearmanr(x, y)
+
+    # Figure and scatter of raw trials
     fig, ax = plt.subplots(figsize=figsize)
-    ax.scatter(stats["delay_mean"], stats["err_std"],
-               color=color, s=60, alpha=alpha, label="binned std")
+    ax.scatter(x, y, color=color, s=20, alpha=alpha, label="single trials")
 
-    # Fit and plot linear trend if enough points
-    if len(stats) > 2:
-        coeffs = np.polyfit(stats["delay_mean"], stats["err_std"], 1)
-        xs = np.linspace(stats["delay_mean"].min(), stats["delay_mean"].max(), 100)
+    # Linear fit (degree 1 polynomial) purely for visualization
+    if len(valid) > 2:
+        coeffs = np.polyfit(x, y, 1)
+        xs = np.linspace(x.min(), x.max(), 200)
         ys = np.polyval(coeffs, xs)
-        ax.plot(xs, ys, color="red", label=f"fit: slope={coeffs[0]:.2f} std/s")
+        ax.plot(xs, ys, "r-", linewidth=2,
+                label=f"linear fit (slope = {coeffs[0]:.3f})")
 
-    ax.set_xlabel("Memory delay (s)")
-    ax.set_ylabel("Std of error (deg)")
+    # Labels and title, include Spearman result in subtitle/legend
+    ax.set_xlabel("Duration (s)")
+    ax.set_ylabel("Error (deg)")
     ax.set_title(title)
+
+    # Add Spearman info as text in the plot
+    ax.text(
+        0.05, 0.95,
+        f"Spearman ρ = {rho:.3f}\n p = {pval:.3g}",
+        transform=ax.transAxes,
+        va="top", ha="left",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
+    )
+
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -355,8 +372,7 @@ def plot_error_variability_vs_delay(
 def plot_error_vs_prev_diff(
     df: pd.DataFrame,
     diff_col: str = "diff",
-    err_col: str = "err",
-    bin_size: int = 30,
+    err_col: str = "folded_err",
     figsize: tuple[int, int] = (8, 5),
     color: str = "steelblue",
     show: bool = True,
@@ -365,82 +381,58 @@ def plot_error_vs_prev_diff(
     title: str = "Mean error vs. |Prev − Curr| angular difference",
 ) -> plt.Figure:
     """
-    Plot mean ± SEM of angular error as a function of the absolute difference
-    between previous and current target directions.
+    Plot mean ± SEM of angular error as a function of the absolute
+    difference between previous and current target directions.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain columns `diff` and `err` (from memory-delay features).
-    diff_col : str, optional
-        Column name for angular difference (default 'diff').
-    err_col : str, optional
-        Column name for angular error (default 'err').
-    bin_size : int, optional
-        Bin width in degrees (default 30°).
-    figsize : tuple[int, int], optional
-        Figure size (default (8,5)).
-    color : str, optional
-        Line/marker color (default "steelblue").
-    show : bool, optional
-        Whether to display the plot immediately (default True).
-    save_path : str | None, optional
-        If provided, saves the figure to the given path.
-    verbose : bool, optional
-        If True, print per-bin debug information (default False).
-    title : str, optional
-        Plot title.
-
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-        The generated matplotlib figure.
+    This version uses **no binning** — each unique absolute diff
+    value is treated independently.
     """
+
     if diff_col not in df.columns or err_col not in df.columns:
         raise ValueError(f"Missing required columns: {diff_col}, {err_col}")
 
+    # Drop NaNs
     valid = df[[diff_col, err_col]].dropna().copy()
 
-    # Define bin edges
-    bin_edges = np.arange(-180, 181, bin_size)
-    valid["diff_bin"] = pd.cut(valid[diff_col], bins=bin_edges)
+    # Use absolute difference
+    valid["abs_diff"] = valid[diff_col].abs()
 
-    if verbose:
-        print("Diff bins:")
-        print(valid["diff_bin"].value_counts().sort_index())
+    # Group by each unique abs_diff value exactly
+    stats = (
+        valid.groupby("abs_diff", observed=False)[err_col]
+        .agg(["mean", "count", "std"])
+        .reset_index()
+        .sort_values("abs_diff")
+    )
 
-    # Compute per-bin stats
-    stats = valid.groupby("diff_bin", observed=False)[err_col].agg(["mean", "count", "std"])
+    # Compute SEM
     stats["sem"] = stats["std"] / np.sqrt(stats["count"])
 
-    # Bin centers for plotting
-    bin_centers = [interval.mid for interval in stats.index]
-
     if verbose:
-        for center, interval in zip(bin_centers, stats.index):
-            bin_err_values = valid.loc[valid["diff_bin"] == interval, err_col].tolist()
-            bin_diff_values = valid.loc[valid["diff_bin"] == interval, diff_col].tolist()
-            print(f"Bin Center: {center}, Bin Range: {interval}, "
-                  f"Diff Values: {bin_diff_values}, Err Values: {bin_err_values}")
+        print(stats)
 
     # Plot
     fig, ax = plt.subplots(figsize=figsize)
+
     ax.errorbar(
-        bin_centers,
+        stats["abs_diff"],
         stats["mean"],
         yerr=stats["sem"],
-        fmt="o-",
-        capsize=4,
+        fmt="o",
         color=color,
-        label="mean ± SEM"
+        capsize=3,
+        markersize=4,
+        label="mean ± SEM (no bins)"
     )
+    ax.plot(stats["abs_diff"], stats["mean"], color=color, linewidth=1)
 
     ax.axhline(0, color="red", linestyle="--", alpha=0.7)
-    ax.set_xlabel("abs(Prev − Curr) (deg, binned)")
-    ax.set_ylabel("Error (deg)")
+    ax.set_xlabel("|Prev − Curr| (deg)")
+    ax.set_ylabel("Folded Error (deg)")
     ax.set_title(title)
     ax.legend()
     ax.grid(alpha=0.3)
+    ax.set_ylim(-1,1)
     plt.tight_layout()
 
     if save_path:
